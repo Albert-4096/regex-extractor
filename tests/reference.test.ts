@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extract, formatOutput, defaultFormatOptions } from '../src/core';
+import { defaultConfig, extract, formatOutput, defaultFormatOptions } from '../src/core';
 import { only } from './helpers';
 
 const INPUT = [
@@ -28,5 +28,12 @@ describe('acceptance test #1 (reference behavior)', () => {
       [2, '11111110'],
     ]);
     for (const m of res.matches) expect(INPUT.slice(m.start, m.end)).toBe(m.text);
+  });
+
+  it('the preloaded sample gives the same output with every default detector enabled', () => {
+    const res = extract(INPUT, defaultConfig());
+    const out = formatOutput(res.matches, res.lineCount, defaultFormatOptions());
+    expect(out).toBe('01110101, 10001010\n01101110, 10110100, 11111110');
+    expect(new Set(res.matches.map((m) => m.type))).toEqual(new Set(['binary']));
   });
 });

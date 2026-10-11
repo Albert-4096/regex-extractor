@@ -1,0 +1,11 @@
+# Optional override: also join an external reverse-proxy network named "edge".
+# Create it once with `docker network create edge`, then run:
+#   docker compose -f docker-compose.yml -f docker-compose.edge.yml up -d --build
+# or put COMPOSE_FILE=docker-compose.yml:docker-compose.edge.yml in a local .env file.
+services:
+  regex-extractor:
+    networks: [default, edge]
+
+networks:
+  edge:
+    external: true

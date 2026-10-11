@@ -1,0 +1,19 @@
+# Static, fully client-side site served by unprivileged nginx.
+#   docker compose up -d --build     ->  http://127.0.0.1:${PORT:-8080}
+services:
+  regex-extractor:
+    build: .
+    image: regex-extractor:latest
+    container_name: regex-extractor
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT:-8080}:8080"
+    environment:
+      - TZ=${TZ:-UTC}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

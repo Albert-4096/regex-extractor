@@ -213,7 +213,9 @@ describe('detector registry', () => {
   });
   it('defaults: noisy detectors are off, core ones are on', () => {
     const on = DETECTORS.filter((d) => d.defaultEnabled).map((d) => d.id);
-    for (const id of ['binary', 'hex', 'hash', 'base64', 'flag']) expect(on).toContain(id);
+    for (const id of ['binary', 'hex', 'hash', 'base64', 'flag', 'jwt', 'url', 'email', 'uuid', 'mac', 'ipv4', 'ipv6']) {
+      expect(on).toContain(id);
+    }
     for (const id of ['iso8601', 'decimal-int', 'decimal-float', 'quoted-string']) expect(on).not.toContain(id);
   });
   it('every detector has at least 4 positive and 4 negative cases', () => {
