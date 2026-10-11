@@ -1,13 +1,26 @@
 import './styles.css';
-import { MAX_INPUT_CHARS, computeStats, formatOutput, parseSettings, serializeSettings, tableRows, TABLE_HEADER } from '../core';
-import type { OutputFormat, RunResult } from '../core';
+import {
+  MAX_INPUT_CHARS,
+  computeStats,
+  formatOutput,
+  lineAt,
+  parseSettings,
+  resolveOverlaps,
+  serializeSettings,
+  splitLines,
+  TABLE_HEADER,
+  tableRows,
+} from '../core';
+import type { Candidate, InferCandidate, InferResult, Match, OutputFormat, RunResult, Span } from '../core';
 import { createRunner, StaleError, TimeoutError } from '../worker/client';
 import { clear, h } from './dom';
 import { typeClass } from './colors';
-import { renderHighlight, HIGHLIGHT_LIMIT } from './highlight';
+import { HIGHLIGHT_LIMIT, describeMatch, renderHighlight } from './highlight';
 import { SettingsPanel } from './panel';
 import { SAMPLE_INPUT, initialState } from './state';
 import { readStorage, removeStorage, writeStorage } from './storage';
+import { TeachPanel } from './teach';
+import type { TeachState } from './teach';
 
 const SETTINGS_KEY = 'regex-extractor:settings:v1';
 const INPUT_KEY = 'regex-extractor:input:v1';
@@ -15,7 +28,20 @@ const DEBOUNCE_MS = 150;
 const TABLE_ROW_LIMIT = 2000;
 
 const state = initialState();
+/** Two workers: a new example must never cancel a running extraction, and vice versa. */
 const runner = createRunner();
+const inferRunner = createRunner();
+
+const teach: TeachState = {
+  text: '',
+  positives: [],
+  negatives: [],
+  result: null,
+  selected: -1,
+  running: false,
+  error: null,
+  note: '',
+};
 
 /* ---------- restore convenience state ---------- */
 {
@@ -50,6 +76,7 @@ const inputMeta = h('span', { class: 'muted', 'aria-live': 'polite' });
 const inputNotice = h('p', { class: 'notice error', role: 'alert', hidden: true });
 const hlView = h('pre', { class: 'hl-view', tabindex: 0, 'aria-label': 'Highlighted input' });
 const hlNote = h('span', { class: 'muted' });
+const teachSummary = h('p', { class: 'teach-summary muted', role: 'status', 'aria-live': 'polite' });
 
 const formatSelect = h(
   'select',
@@ -74,41 +101,70 @@ const outText = h('textarea', { class: 'out-text', readOnly: true, spellcheck: f
 const tableWrap = h('div', { class: 'table-wrap', hidden: true });
 const outStatus = h('p', { class: 'muted', role: 'status', 'aria-live': 'polite' });
 
-const panel = new SettingsPanel(state, {
-  onConfigChange: () => {
-    persistSettings();
-    scheduleRun();
+const teachPanel = new TeachPanel({
+  select: (i) => {
+    teach.selected = i;
+    renderTeach();
+    renderHighlightView();
   },
-  onOutputChange: () => {
-    persistSettings();
-    renderOutput();
+  adopt: (c: InferCandidate) => {
+    const n = state.config.custom.length + 1;
+    panel.addCustom({ label: `learned ${n}`, pattern: c.pattern, flags: c.flags, captureMode: 'full' });
+    teach.note = `Added "learned ${n}" to the custom regexes.`;
+    renderTeach();
   },
-  onPersistChange: () => {
-    persistSettings();
-    persistInput();
+  removeExample: (kind, i) => {
+    (kind === 'pos' ? teach.positives : teach.negatives).splice(i, 1);
+    examplesChanged();
   },
-  onReplaced: () => {
-    panel.build();
-    formatSelect.value = state.output.format;
-    persistSettings();
-    scheduleRun(true);
-    renderOutput();
+  clearExamples: () => {
+    teach.positives = [];
+    teach.negatives = [];
+    examplesChanged();
   },
-  download,
+  copyText: (text, what) => copyToClipboard(text, what),
 });
+
+const panel = new SettingsPanel(
+  state,
+  {
+    onConfigChange: () => {
+      persistSettings();
+      scheduleRun();
+      scheduleInfer();
+    },
+    onOutputChange: () => {
+      persistSettings();
+      renderOutput();
+    },
+    onPersistChange: () => {
+      persistSettings();
+      persistInput();
+    },
+    onReplaced: () => {
+      panel.build();
+      formatSelect.value = state.output.format;
+      persistSettings();
+      scheduleRun(true);
+      renderOutput();
+    },
+    download,
+    snippets: (pattern, flags) => teachPanel.snippetList(pattern, flags),
+  },
+  { sections: [teachPanel.el] },
+);
+
+function openSettings(open = true): void {
+  panel.el.hidden = !open;
+  settingsToggle.setAttribute('aria-expanded', String(open));
+  layout.classList.toggle('settings-open', open);
+}
 
 const settingsToggle = h('button', {
   text: 'Settings',
   'aria-expanded': 'false',
   'aria-controls': 'settings',
-  on: {
-    click: () => {
-      const open = panel.el.hidden;
-      panel.el.hidden = !open;
-      settingsToggle.setAttribute('aria-expanded', String(open));
-      layout.classList.toggle('settings-open', open);
-    },
-  },
+  on: { click: () => openSettings(panel.el.hidden) },
 });
 
 const clearBtn = h('button', {
@@ -121,6 +177,17 @@ const clearBtn = h('button', {
   },
 });
 const sampleBtn = h('button', { text: 'Load sample', on: { click: () => setInput(SAMPLE_INPUT, true) } });
+const extractBtn = h('button', {
+  class: 'primary',
+  text: 'Extract this',
+  title: 'Use the selected text as a positive example',
+  on: { click: () => addExample('pos') },
+});
+const notBtn = h('button', {
+  text: 'Not this',
+  title: 'Use the selected text as a negative example',
+  on: { click: () => addExample('neg') },
+});
 
 const leftCol = h(
   'div',
@@ -139,6 +206,7 @@ const leftCol = h(
       clearBtn,
     ),
     inputArea,
+    h('div', { class: 'row' }, extractBtn, notBtn, h('span', { class: 'muted', text: 'Select text above, then teach the tool by example.' })),
     inputNotice,
   ),
   h(
@@ -146,6 +214,7 @@ const leftCol = h(
     { class: 'pane', 'aria-labelledby': 'hl-h' },
     h('div', { class: 'pane-head' }, h('h2', { id: 'hl-h', text: 'Highlighted view' }), hlNote),
     hlView,
+    teachSummary,
   ),
 );
 const rightCol = h(
@@ -174,19 +243,23 @@ const rightCol = h(
 );
 
 const layout = h('div', { class: 'layout' }, h('main', { class: 'work' }, leftCol, rightCol), panel.el);
-const app = document.getElementById('app')!;
-app.append(
-  h('div', { class: 'app' }, h(
-    'header',
-    { class: 'topbar' },
-    h('h1', { text: 'regex-extractor' }),
-    h('span', { class: 'tag', text: 'paste text, get the values · runs 100% in your browser' }),
-    h('span', { class: 'spacer' }),
-    settingsToggle,
-  ), layout),
+document.getElementById('app')!.append(
+  h(
+    'div',
+    { class: 'app' },
+    h(
+      'header',
+      { class: 'topbar' },
+      h('h1', { text: 'regex-extractor' }),
+      h('span', { class: 'tag', text: 'paste text, get the values · runs 100% in your browser' }),
+      h('span', { class: 'spacer' }),
+      settingsToggle,
+    ),
+    layout,
+  ),
 );
 
-/* ---------- running ---------- */
+/* ---------- running extraction ---------- */
 let seq = 0;
 let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -223,11 +296,114 @@ async function doRun(): Promise<void> {
   renderAll();
 }
 
-/* ---------- rendering ---------- */
-function visibleMatches() {
-  return state.result?.matches ?? [];
+/* ---------- running inference ---------- */
+let inferSeq = 0;
+let inferTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleInfer(immediate = false): void {
+  if (inferTimer !== undefined) clearTimeout(inferTimer);
+  if (teach.positives.length === 0) {
+    inferSeq++;
+    teach.result = null;
+    teach.selected = -1;
+    teach.running = false;
+    teach.error = null;
+    renderTeach();
+    renderHighlightView();
+    return;
+  }
+  inferTimer = setTimeout(() => void doInfer(), immediate ? 0 : DEBOUNCE_MS);
 }
 
+async function doInfer(): Promise<void> {
+  const mine = ++inferSeq;
+  teach.running = true;
+  teach.text = state.input;
+  renderTeach();
+  try {
+    const res = await inferRunner.run<InferResult>({
+      op: 'infer',
+      text: state.input,
+      positives: teach.positives,
+      negatives: teach.negatives,
+      acrossText: state.config.acrossText,
+    });
+    if (mine !== inferSeq) return;
+    teach.result = res;
+    teach.selected = res.defaultIndex;
+    teach.error = null;
+  } catch (e) {
+    if (e instanceof StaleError || mine !== inferSeq) return;
+    teach.result = null;
+    teach.selected = -1;
+    teach.error =
+      e instanceof TimeoutError
+        ? 'Inference took longer than 2 s and was stopped. Try fewer examples or a shorter input.'
+        : `Inference failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  teach.running = false;
+  renderTeach();
+  renderHighlightView();
+}
+
+/* ---------- examples ---------- */
+const sameSpan = (a: Span, b: Span) => a.start === b.start && a.end === b.end;
+
+function addExample(kind: 'pos' | 'neg'): void {
+  const text = state.input;
+  let start = inputArea.selectionStart;
+  let end = inputArea.selectionEnd;
+  while (start < end && /\s/.test(text[start])) start++;
+  while (end > start && /\s/.test(text[end - 1])) end--;
+  // Only auto-open when the panel sits beside the content; on narrow screens it is an overlay.
+  if (window.matchMedia('(min-width: 1201px)').matches) openSettings(true);
+  teachPanel.open();
+  if (start >= end) {
+    teach.note = 'Select some text in the input first, then press the button.';
+    renderTeach();
+    return;
+  }
+  setExample({ start, end }, kind);
+}
+
+function setExample(sp: Span, kind: 'pos' | 'neg'): void {
+  teach.positives = teach.positives.filter((s) => !sameSpan(s, sp));
+  teach.negatives = teach.negatives.filter((s) => !sameSpan(s, sp));
+  (kind === 'pos' ? teach.positives : teach.negatives).push(sp);
+  examplesChanged();
+}
+
+/**
+ * Click on a highlight cycles its example state. Normal spans: neutral -> positive -> negative ->
+ * neutral. "Also matched" spans go to negative first, because that is what the user usually wants.
+ */
+function cycleExample(sp: Span, alsoMatched = false): void {
+  const state: 'none' | 'pos' | 'neg' = teach.positives.some((s) => sameSpan(s, sp))
+    ? 'pos'
+    : teach.negatives.some((s) => sameSpan(s, sp))
+      ? 'neg'
+      : 'none';
+  const order: ('none' | 'pos' | 'neg')[] = alsoMatched ? ['none', 'neg', 'pos'] : ['none', 'pos', 'neg'];
+  const next = order[(order.indexOf(state) + 1) % 3];
+  if (next === 'none') {
+    teach.positives = teach.positives.filter((s) => !sameSpan(s, sp));
+    teach.negatives = teach.negatives.filter((s) => !sameSpan(s, sp));
+    examplesChanged();
+  } else setExample(sp, next);
+}
+
+function examplesChanged(): void {
+  teach.positives.sort((a, b) => a.start - b.start);
+  teach.negatives.sort((a, b) => a.start - b.start);
+  teach.note = '';
+  teach.text = state.input;
+  renderTeach();
+  renderHighlightView();
+  renderOutput();
+  scheduleInfer();
+}
+
+/* ---------- rendering ---------- */
 function currentText(): string {
   const r = state.result;
   if (!r) return '';
@@ -242,10 +418,23 @@ function renderAll(): void {
   panel.setErrors(state.result?.errors ?? []);
 }
 
+function renderTeach(): void {
+  teach.text = state.input;
+  teachPanel.update(teach);
+  const c = teach.result && teach.selected >= 0 ? teach.result.candidates[teach.selected] : undefined;
+  teachSummary.textContent = teach.note
+    ? teach.note
+    : c
+      ? `Learned ${c.pattern} · ${c.count.toLocaleString()} matches, ${c.also.toLocaleString()} also matched (lighter highlights).`
+      : teach.result?.conflict
+        ? teach.result.conflict.message
+        : '';
+}
+
 function renderInputMeta(): void {
   sampleBadge.hidden = !state.isSample;
   const n = state.input.length;
-  const lines = n === 0 ? 0 : state.input.split(/\r\n|\n|\r/).length;
+  const lines = n === 0 ? 0 : splitLines(state.input).length;
   inputMeta.textContent = `${n.toLocaleString()} chars · ${lines.toLocaleString()} lines`;
   if (n > MAX_INPUT_CHARS) {
     inputNotice.hidden = false;
@@ -299,15 +488,66 @@ function renderStatus(): void {
   statsBar.append(h('span', { class: 'muted', text: `${r.elapsedMs} ms${state.running ? ' · running…' : ''}` }));
 }
 
+type Role = 'pos' | 'neg' | 'also' | 'match';
+
+/** Detector matches + examples + "also matched" spans, resolved so they never overlap. */
+function buildDisplay(): { list: Match[]; roles: Role[]; original: Map<string, Match> } {
+  const text = state.input;
+  const lines = splitLines(text);
+  const cands: Candidate[] = [];
+  const original = new Map<string, Match>();
+  const lineOf = (s: number) => lineAt(lines, s);
+  for (const m of state.result?.matches ?? []) {
+    original.set(`${m.start}:${m.end}`, m);
+    cands.push({ start: m.start, end: m.end, text: m.text, type: m.type, priority: 1000, line: m.line });
+  }
+  const sel = teach.result && teach.selected >= 0 ? teach.result.candidates[teach.selected] : undefined;
+  if (sel) {
+    for (const s of sel.alsoSpans) {
+      cands.push({ start: s.start, end: s.end, text: text.slice(s.start, s.end), type: '#also', priority: 2000, line: lineOf(s.start) });
+    }
+  }
+  for (const s of teach.negatives) {
+    if (s.end <= text.length) cands.push({ start: s.start, end: s.end, text: text.slice(s.start, s.end), type: '#neg', priority: 3000, line: lineOf(s.start) });
+  }
+  for (const s of teach.positives) {
+    if (s.end <= text.length) cands.push({ start: s.start, end: s.end, text: text.slice(s.start, s.end), type: '#pos', priority: 4000, line: lineOf(s.start) });
+  }
+  const list = resolveOverlaps(cands);
+  const roles: Role[] = list.map((m) => (m.type === '#pos' ? 'pos' : m.type === '#neg' ? 'neg' : m.type === '#also' ? 'also' : 'match'));
+  return { list, roles, original };
+}
+
 function renderHighlightView(): void {
-  const r = state.result;
-  const matches = r ? r.matches : [];
-  const { shown } = renderHighlight(hlView, state.input, matches);
+  const { list, roles, original } = buildDisplay();
+  const { shown } = renderHighlight(hlView, state.input, list, {
+    baseClass: (m, i) => (roles[i] === 'match' ? undefined : original.get(`${m.start}:${m.end}`) ? typeClass(original.get(`${m.start}:${m.end}`)!.type) : 't7'),
+    extraClass: (_m, i) => (roles[i] === 'pos' ? 'ex-pos' : roles[i] === 'neg' ? 'ex-neg' : roles[i] === 'also' ? 'also' : ''),
+    title: (m, i) => {
+      const orig = original.get(`${m.start}:${m.end}`);
+      const base = orig ? describeMatch(orig) : `chars ${m.start}–${m.end}`;
+      const label =
+        roles[i] === 'pos'
+          ? 'Positive example'
+          : roles[i] === 'neg'
+            ? 'Negative example'
+            : roles[i] === 'also'
+              ? 'Also matched by the learned pattern'
+              : '';
+      const hint = roles[i] === 'also' ? 'Click to cycle: negative → positive → neutral' : 'Click to cycle: positive → negative → neutral';
+      return label ? `${label} · ${base} · ${hint}` : `${base} · ${hint}`;
+    },
+    onClickMatch: (i) => {
+      const m = list[i];
+      if (m) cycleExample({ start: m.start, end: m.end }, roles[i] === 'also');
+    },
+  });
+  const total = list.length;
   hlNote.textContent =
-    matches.length > HIGHLIGHT_LIMIT
-      ? `Highlighting the first ${HIGHLIGHT_LIMIT.toLocaleString()} of ${matches.length.toLocaleString()} matches`
+    total > HIGHLIGHT_LIMIT
+      ? `Highlighting the first ${HIGHLIGHT_LIMIT.toLocaleString()} of ${total.toLocaleString()} spans`
       : shown > 0
-        ? 'Hover a highlight for type, offsets, alternatives'
+        ? 'Hover a highlight for details. Click one to mark it as an example.'
         : '';
 }
 
@@ -321,22 +561,36 @@ function renderOutput(): void {
   outText.hidden = table;
   if (table) {
     clear(tableWrap);
-    const rows = tableRows(applyTypeFilter());
-    const shown = rows.slice(0, TABLE_ROW_LIMIT);
-    const head = h('tr', {}, ...TABLE_HEADER.map((t) => h('th', { scope: 'col', text: t })));
-    const body = shown.map((row) => h('tr', {}, ...row.map((c) => h('td', { text: c }))));
+    const filtered = applyTypeFilter();
+    const rows = tableRows(filtered);
+    const shown = Math.min(rows.length, TABLE_ROW_LIMIT);
+    const head = h('tr', {}, h('th', { scope: 'col', text: 'example' }), ...TABLE_HEADER.map((t) => h('th', { scope: 'col', text: t })));
+    const body: HTMLElement[] = [];
+    for (let i = 0; i < shown; i++) {
+      const m = filtered[i];
+      const sp = { start: m.start, end: m.end };
+      const role = teach.positives.some((s) => sameSpan(s, sp)) ? 'positive' : teach.negatives.some((s) => sameSpan(s, sp)) ? 'negative' : 'neutral';
+      const symbol = role === 'positive' ? '+' : role === 'negative' ? '−' : '·';
+      const btn = h('button', {
+        class: 'small',
+        text: symbol,
+        'aria-label': `Example state of ${m.text}: ${role}. Activate to cycle.`,
+        on: { click: () => cycleExample(sp) },
+      });
+      body.push(h('tr', {}, h('td', {}, btn), ...rows[i].map((c) => h('td', { text: c }))));
+    }
     tableWrap.append(h('table', {}, h('thead', {}, head), h('tbody', {}, ...body)));
-    if (rows.length > shown.length) {
-      tableWrap.append(h('p', { class: 'notice', text: `Showing ${shown.length} of ${rows.length} rows. Copy and Download include all rows.` }));
+    if (rows.length > shown) {
+      tableWrap.append(h('p', { class: 'notice', text: `Showing ${shown} of ${rows.length} rows. Copy and Download include all rows.` }));
     }
   }
   copyBtn.disabled = text === '';
   downloadBtn.disabled = text === '';
 }
 
-function applyTypeFilter() {
+function applyTypeFilter(): Match[] {
   const t = state.output.types;
-  const all = visibleMatches();
+  const all = state.result?.matches ?? [];
   return t ? all.filter((m) => t.includes(m.type)) : all;
 }
 
@@ -345,9 +599,23 @@ function setInput(value: string, sample = false): void {
   state.input = value;
   state.isSample = sample;
   inputArea.value = value;
+  clearExamplesForInputChange();
   persistInput();
   renderInputMeta();
   scheduleRun(true);
+}
+
+function clearExamplesForInputChange(): void {
+  const had = teach.positives.length + teach.negatives.length > 0;
+  teach.positives = [];
+  teach.negatives = [];
+  teach.result = null;
+  teach.selected = -1;
+  teach.error = null;
+  teach.running = false;
+  inferSeq++;
+  teach.note = had ? 'Examples were cleared because the input changed.' : '';
+  renderTeach();
 }
 
 function download(filename: string, mime: string, text: string): void {
@@ -386,6 +654,21 @@ copyBtn.addEventListener('click', () => {
   navigator.clipboard.writeText(text).then(done, fail);
 });
 
+function copyToClipboard(text: string, what: string): void {
+  const fail = () => {
+    teach.note = `Clipboard access was blocked. Select the ${what} text and press Ctrl+C.`;
+    renderTeach();
+  };
+  if (!navigator.clipboard) {
+    fail();
+    return;
+  }
+  navigator.clipboard.writeText(text).then(() => {
+    teach.note = `Copied ${what}.`;
+    renderTeach();
+  }, fail);
+}
+
 downloadBtn.addEventListener('click', () => {
   const ext: Record<OutputFormat, [string, string]> = {
     perline: ['txt', 'text/plain'],
@@ -407,6 +690,7 @@ formatSelect.addEventListener('change', () => {
 inputArea.addEventListener('input', () => {
   state.input = inputArea.value;
   state.isSample = false;
+  clearExamplesForInputChange();
   persistInput();
   renderInputMeta();
   scheduleRun();
@@ -428,5 +712,6 @@ function persistInput(): void {
 
 /* ---------- go ---------- */
 formatSelect.value = state.output.format;
+renderTeach();
 renderAll();
 scheduleRun(true);

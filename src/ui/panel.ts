@@ -14,6 +14,8 @@ export interface PanelHooks {
   /** Settings were replaced wholesale (import / reset). */
   onReplaced(): void;
   download(filename: string, mime: string, text: string): void;
+  /** Builds the "copy as" snippet list for a pattern (lazy, on expand). */
+  snippets(pattern: string, flags: string): HTMLElement;
 }
 
 /** Extra sections (e.g. teach-by-example) mounted by the app at the top of the panel. */
@@ -288,6 +290,12 @@ export class SettingsPanel {
       this.fillCustom();
       this.hooks.onConfigChange();
     };
+    const copyAs = h('details', {}, h('summary', { text: 'Copy as…' }));
+    copyAs.addEventListener('toggle', () => {
+      if (!copyAs.open) return;
+      while (copyAs.children.length > 1) copyAs.lastElementChild?.remove();
+      if (entry.pattern !== '') copyAs.append(this.hooks.snippets(entry.pattern, entry.flags));
+    });
     return h(
       'div',
       { class: 'custom-entry' },
@@ -305,6 +313,7 @@ export class SettingsPanel {
         h('button', { class: 'small', text: 'Remove', on: { click: remove } }),
       ),
       err,
+      copyAs,
     );
   }
 

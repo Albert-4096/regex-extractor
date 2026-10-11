@@ -489,3 +489,27 @@ th {
     scroll-behavior: auto !important;
   }
 }
+
+/* ---------- teach by example ---------- */
+.examples {
+  list-style: none;
+  margin: 4px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.examples code {
+  font-family: var(--mono);
+  background: var(--panel-2);
+  padding: 0 4px;
+  border-radius: 3px;
+  overflow-wrap: anywhere;
+}
+.table-wrap td button.small {
+  min-width: 2.2em;
+}
+.teach-summary {
+  margin: 8px 0 0;
+  font-size: 12px;
+}

@@ -13,8 +13,12 @@ export function describeMatch(m: Match): string {
 }
 
 export interface HighlightOptions {
+  /** Replaces the per-type color classes for match `i` (used for example / also-matched spans). */
+  baseClass?: (m: Match, i: number) => string | undefined;
   /** Extra CSS classes for the span of match `i`. */
   extraClass?: (m: Match, i: number) => string;
+  /** Tooltip override for match `i`. */
+  title?: (m: Match, i: number) => string | undefined;
   onClickMatch?: (i: number) => void;
 }
 
@@ -37,8 +41,10 @@ export function renderHighlight(
     const m = matches[i];
     if (m.start < pos) continue;
     if (m.start > pos) frag.append(text.slice(pos, m.start));
-    const cls = ['hl', typeClass(m.type), opts.extraClass?.(m, i) ?? ''].filter(Boolean).join(' ');
-    const span = h('span', { class: cls, title: describeMatch(m), 'data-i': String(i) }, text.slice(m.start, m.end));
+    const base = opts.baseClass?.(m, i) ?? typeClass(m.type);
+    const cls = ['hl', base, opts.extraClass?.(m, i) ?? ''].filter(Boolean).join(' ');
+    const title = opts.title?.(m, i) ?? describeMatch(m);
+    const span = h('span', { class: cls, title, 'data-i': String(i) }, text.slice(m.start, m.end));
     frag.append(span);
     pos = m.end;
   }

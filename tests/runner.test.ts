@@ -112,3 +112,23 @@ describe('worker request handler (the code the real worker runs)', () => {
     expect(a.ok && b.ok).toBe(true);
   });
 });
+
+describe('worker request handler: infer op', () => {
+  it('runs inference inside the worker handler', () => {
+    const text = 'a 01110101 b 10001010';
+    const out = handleRequest({
+      id: 3,
+      op: 'infer',
+      text,
+      positives: [{ start: 2, end: 10 }],
+      negatives: [],
+      acrossText: false,
+    });
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      const r = out.result as { defaultIndex: number; candidates: { pattern: string; count: number }[] };
+      expect(r.candidates[r.defaultIndex].pattern).toBe('[01]{8}');
+      expect(r.candidates[r.defaultIndex].count).toBe(2);
+    }
+  });
+});
